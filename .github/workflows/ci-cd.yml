@@ -1,0 +1,154 @@
+# CI/CD pipeline for the Gradebook project.
+#
+#   push to main ──► build ──► test ──► package ──► deploy (to YOUR computer)
+#
+# build, test and package run on GitHub's cloud machines (ubuntu-latest).
+# deploy runs on a "self-hosted runner" -- a small agent you install on your
+# own laptop -- so the app ends up installed locally. See README.md, Part 4.
+#
+# Deploy is OFF until you set the repository variable DEPLOY_LOCAL = true
+# (Settings > Secrets and variables > Actions > Variables). Without that,
+# the pipeline stops after "package" and the jar is still downloadable from
+# the run's Artifacts section.
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:        # adds a "Run workflow" button on the Actions tab
+
+env:
+  JAVA_VERSION: '17'
+
+jobs:
+  # ---------------------------------------------------------------- BUILD --
+  build:
+    name: 1. Build (compile)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v6
+
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Compile main and test sources
+        run: mvn -B --no-transfer-progress test-compile
+
+  # ----------------------------------------------------------------- TEST --
+  test:
+    name: 2. Test (JUnit 5)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Run unit tests
+        run: mvn -B --no-transfer-progress test
+
+      - name: Write test results to the run summary
+        if: always()          # run even when tests fail -- that's when it matters
+        run: |
+          echo "## JUnit results" >> "$GITHUB_STEP_SUMMARY"
+          if ls target/surefire-reports/*.txt >/dev/null 2>&1; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat target/surefire-reports/*.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No test reports were produced (did the build fail?)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: target/surefire-reports/
+
+  # -------------------------------------------------------------- PACKAGE --
+  package:
+    name: 3. Package (jar)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      # Tests already passed in the previous stage, so we skip re-running them.
+      - name: Build the executable jar
+        run: mvn -B --no-transfer-progress package -DskipTests
+
+      - name: Upload the jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradebook-jar
+          path: target/gradebook.jar
+
+  # --------------------------------------------------------------- DEPLOY --
+  deploy:
+    name: 4. Deploy (local computer)
+    needs: package
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_LOCAL == 'true'
+    runs-on: self-hosted       # <-- runs on the runner installed on YOUR machine
+    steps:
+      - name: Download the jar built in stage 3
+        uses: actions/download-artifact@v4
+        with:
+          name: gradebook-jar
+
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # ---- macOS / Linux ----
+      - name: Install to ~/gradebook-deploy and smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          DEPLOY_DIR="$HOME/gradebook-deploy"
+          mkdir -p "$DEPLOY_DIR"
+          if [ -f "$DEPLOY_DIR/gradebook.jar" ]; then
+            cp "$DEPLOY_DIR/gradebook.jar" "$DEPLOY_DIR/gradebook.previous.jar"
+          fi
+          cp gradebook.jar "$DEPLOY_DIR/gradebook.jar"
+          echo "Deployed commit ${GITHUB_SHA::7} at $(date)" > "$DEPLOY_DIR/DEPLOYED.txt"
+          echo "Installed to $DEPLOY_DIR"
+          echo "---- smoke test ----"
+          java -jar "$DEPLOY_DIR/gradebook.jar"
+
+      # ---- Windows ----
+      - name: Install to %USERPROFILE%\gradebook-deploy and smoke test
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $deployDir = Join-Path $env:USERPROFILE "gradebook-deploy"
+          New-Item -ItemType Directory -Force -Path $deployDir | Out-Null
+          $target = Join-Path $deployDir "gradebook.jar"
+          if (Test-Path $target) {
+            Copy-Item $target (Join-Path $deployDir "gradebook.previous.jar") -Force
+          }
+          Copy-Item "gradebook.jar" $target -Force
+          "Deployed commit $($env:GITHUB_SHA.Substring(0,7)) at $(Get-Date)" |
+            Out-File (Join-Path $deployDir "DEPLOYED.txt")
+          Write-Host "Installed to $deployDir"
+          Write-Host "---- smoke test ----"
+          java -jar $target
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

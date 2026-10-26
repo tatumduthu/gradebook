@@ -1,0 +1,18 @@
+# Maven
+target/
+
+# Eclipse
+.classpath
+.project
+.settings/
+bin/
+.metadata/
+
+# IntelliJ / VS Code (in case anyone uses them)
+.idea/
+*.iml
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
